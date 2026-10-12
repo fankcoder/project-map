@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "project-map",
+  "description": "Build and validate a token-efficient architecture map for an existing codebase.",
+  "version": "0.1.0",
+  "author": {
+    "name": "fankcoder",
+    "url": "https://github.com/fankcoder"
+  },
+  "license": "MIT",
+  "keywords": ["codex", "codebase", "architecture", "context"]
+}

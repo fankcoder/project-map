@@ -1,0 +1,607 @@
+#!/usr/bin/env python3
+"""Generate and validate a local, dependency-free project architecture map."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import json
+import os
+import posixpath
+import re
+import subprocess
+import sys
+import tomllib
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable
+
+
+ANALYZER_VERSION = "0.1.0"
+DEFAULT_MAP = Path(".codex/project-map.md")
+DEFAULT_MANIFEST = Path(".codex/project-map.manifest.json")
+MAX_TREE_FILES = 500
+MAX_RELATIONSHIPS = 500
+MAX_SYMBOLS = 800
+MAX_DEPENDENCY_NODES = 800
+MAX_DEPENDENCY_DEPTH = 30
+SKIP_DIRS = {
+    ".git", ".hg", ".svn", ".tox", ".venv", "venv", "env", "node_modules",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build",
+}
+SOURCE_SUFFIXES = {".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
+IMPORTANT_FILES = {
+    "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "package.json",
+    "tsconfig.json", "Cargo.toml", "manage.py", "Dockerfile", "Makefile",
+}
+VERSION_FILES = ("pyproject.toml", "package.json", "Cargo.toml")
+
+
+@dataclass
+class Symbol:
+    kind: str
+    name: str
+    line: int
+    end_line: int
+    children: list["Symbol"] = field(default_factory=list)
+    doc: str = ""
+
+
+@dataclass
+class FileInfo:
+    path: str
+    size: int
+    digest: str
+    language: str
+    imports: list[str] = field(default_factory=list)
+    symbols: list[Symbol] = field(default_factory=list)
+    parse_error: str | None = None
+
+
+def run_git(root: Path, *args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip()
+
+
+def git_files(root: Path) -> list[str] | None:
+    output = run_git(root, "ls-files", "-co", "--exclude-standard", "-z")
+    if output is None:
+        return None
+    # Git's -z output is not representable as text when a filename contains a
+    # surrogate. Such a file is not useful input for this human-facing map.
+    return [item for item in output.split("\0") if item]
+
+
+def discover_files(root: Path) -> list[Path]:
+    tracked = git_files(root)
+    if tracked is not None:
+        candidates = [root / item for item in tracked]
+    else:
+        candidates = []
+        for current, dirs, names in os.walk(root):
+            dirs[:] = sorted(name for name in dirs if name not in SKIP_DIRS)
+            candidates.extend(Path(current, name) for name in names)
+    selected = []
+    for path in candidates:
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if any(part in SKIP_DIRS for part in relative.parts):
+            continue
+        if path.suffix.lower() in SOURCE_SUFFIXES or path.name in IMPORTANT_FILES:
+            selected.append(path)
+    return sorted(selected, key=lambda item: item.relative_to(root).as_posix())
+
+
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def digest(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def source_fingerprint(files: list[FileInfo]) -> str:
+    hasher = hashlib.sha256()
+    for info in sorted(files, key=lambda item: item.path):
+        hasher.update(info.path.encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(info.digest.encode("ascii"))
+        hasher.update(b"\0")
+    return hasher.hexdigest()
+
+
+def project_versions(root: Path) -> dict[str, str]:
+    """Read declared project versions without importing project code."""
+    versions = {}
+    pyproject = root / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            data = tomllib.loads(read_text(pyproject))
+            version = data.get("project", {}).get("version")
+            if isinstance(version, str):
+                versions["pyproject.toml"] = version
+        except (tomllib.TOMLDecodeError, OSError):
+            versions["pyproject.toml"] = "<unreadable>"
+    package = root / "package.json"
+    if package.is_file():
+        try:
+            data = json.loads(read_text(package))
+            version = data.get("version")
+            if isinstance(version, str):
+                versions["package.json"] = version
+        except (json.JSONDecodeError, OSError):
+            versions["package.json"] = "<unreadable>"
+    cargo = root / "Cargo.toml"
+    if cargo.is_file():
+        try:
+            data = tomllib.loads(read_text(cargo))
+            version = data.get("package", {}).get("version")
+            if isinstance(version, str):
+                versions["Cargo.toml"] = version
+        except (tomllib.TOMLDecodeError, OSError):
+            versions["Cargo.toml"] = "<unreadable>"
+    return versions
+
+
+def clean_doc(value: str | None) -> str:
+    if not value:
+        return ""
+    return " ".join(value.strip().split())[:180]
+
+
+def python_symbols(tree: ast.AST) -> list[Symbol]:
+    def convert(node: ast.AST) -> Symbol | None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            kind = "async function" if isinstance(node, ast.AsyncFunctionDef) else "function"
+        elif isinstance(node, ast.ClassDef):
+            kind = "class"
+        else:
+            return None
+        children = []
+        if isinstance(node, ast.ClassDef):
+            for child in node.body:
+                converted = convert(child)
+                if converted:
+                    children.append(converted)
+        return Symbol(kind, node.name, node.lineno, getattr(node, "end_lineno", node.lineno), children,
+                      clean_doc(ast.get_docstring(node)))
+
+    return [item for node in tree.body if (item := convert(node))]
+
+
+def python_imports(tree: ast.AST) -> list[str]:
+    values = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            values.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            prefix = "." * node.level + (node.module or "")
+            if node.module is None:
+                values.extend(prefix + alias.name for alias in node.names)
+            else:
+                values.append(prefix)
+    return sorted(set(values))
+
+
+JS_MODULE_RE = re.compile(
+    r"(?:import|export)\s+(?:[^;\n]*?\s+from\s+)?['\"]([^'\"]+)['\"]"
+)
+JS_REQUIRE_RE = re.compile(r"(?:require|import)\(\s*['\"]([^'\"]+)['\"]\s*\)")
+EXPORT_RE = re.compile(r"^\s*export\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|let|var)\s+([A-Za-z_$][\w$]*)", re.MULTILINE)
+FUNCTION_RE = re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(", re.MULTILINE)
+CLASS_RE = re.compile(r"^\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)", re.MULTILINE)
+
+
+def line_for(text: str, index: int) -> int:
+    return text.count("\n", 0, index) + 1
+
+
+def javascript_data(text: str) -> tuple[list[str], list[Symbol]]:
+    imports = {match.group(1) for match in JS_MODULE_RE.finditer(text)}
+    imports.update(match.group(1) for match in JS_REQUIRE_RE.finditer(text))
+    symbols = []
+    seen = set()
+    for pattern, kind in ((CLASS_RE, "class"), (FUNCTION_RE, "function"), (EXPORT_RE, "export")):
+        for match in pattern.finditer(text):
+            name = match.group(1)
+            key = (name, line_for(text, match.start()))
+            if key in seen:
+                continue
+            seen.add(key)
+            line = key[1]
+            symbols.append(Symbol(kind, name, line, line))
+    return sorted(imports), sorted(symbols, key=lambda item: (item.line, item.name))
+
+
+def analyze_file(root: Path, path: Path) -> FileInfo:
+    relative = path.relative_to(root).as_posix()
+    data = read_text(path)
+    info = FileInfo(relative, path.stat().st_size, digest(path), "config")
+    if path.suffix.lower() in {".py", ".pyi"}:
+        info.language = "python"
+        try:
+            tree = ast.parse(data, filename=relative)
+            info.imports = python_imports(tree)
+            info.symbols = python_symbols(tree)
+        except SyntaxError as error:
+            info.parse_error = f"line {error.lineno}: {error.msg}"
+    elif path.suffix.lower() in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
+        info.language = "javascript" if path.suffix.lower() in {".js", ".jsx", ".mjs", ".cjs"} else "typescript"
+        info.imports, info.symbols = javascript_data(data)
+    return info
+
+
+def git_commit(root: Path) -> str | None:
+    return run_git(root, "rev-parse", "HEAD")
+
+
+def rel_import(source: str, imported: str, known: set[str]) -> str | None:
+    if not imported or imported.startswith(("@", "http")):
+        return None
+    source_parts = source.rsplit("/", 1)[0].split("/") if "/" in source else []
+    if imported.startswith(("./", "../")):
+        base = "/".join(source_parts)
+        name = posixpath.normpath(posixpath.join(base, imported))
+    elif imported.startswith("."):
+        level = len(imported) - len(imported.lstrip("."))
+        module = imported[level:]
+        base = source_parts[:max(0, len(source_parts) - level + 1)]
+        name = "/".join(base + ([module.replace(".", "/")] if module else []))
+    else:
+        name = imported.replace(".", "/").replace("\\", "/")
+
+    def probes(base: str) -> list[str]:
+        suffixes = (".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
+        return [
+            base,
+            *(base + suffix for suffix in suffixes),
+            f"{base}/__init__.py",
+            *(f"{base}/index{suffix}" for suffix in suffixes[2:]),
+        ]
+
+    candidates = [name]
+    if source_parts and not imported.startswith("."):
+        # Try progressively deeper module roots. This resolves both common
+        # src/package layouts and sibling imports without project execution.
+        candidates.extend(
+            posixpath.join(*source_parts[:depth], name)
+            for depth in range(1, len(source_parts) + 1)
+        )
+    for candidate in candidates:
+        for probe in probes(candidate):
+            if probe in known:
+                return probe
+    return None
+
+
+def render_symbol(symbol: Symbol, indent: int = 0) -> list[str]:
+    prefix = "  " * indent
+    line = f"{prefix}- `{symbol.kind} {symbol.name}` (L{symbol.line}"
+    if symbol.end_line != symbol.line:
+        line += f"-L{symbol.end_line}"
+    line += ")"
+    if symbol.doc:
+        line += f": {symbol.doc}"
+    lines = [line]
+    for child in symbol.children:
+        lines.extend(render_symbol(child, indent + 1))
+    return lines
+
+
+def tree_lines(root: Path, files: list[FileInfo]) -> list[str]:
+    def render(node: dict, prefix: str = "") -> list[str]:
+        lines = []
+        entries = sorted(node.items(), key=lambda item: (not isinstance(item[1], dict), item[0].lower()))
+        for index, (name, value) in enumerate(entries):
+            branch = "└── " if index == len(entries) - 1 else "├── "
+            if isinstance(value, dict):
+                lines.append(f"{prefix}{branch}{name}/")
+                lines.extend(render(value, prefix + ("    " if index == len(entries) - 1 else "│   ")))
+            else:
+                label = value.language
+                lines.append(f"{prefix}{branch}{name} [{label}, {value.size} bytes]")
+        return lines
+
+    visible = files[:MAX_TREE_FILES]
+    tree = {}
+    for info in visible:
+        cursor = tree
+        parts = info.path.split("/")
+        for part in parts[:-1]:
+            cursor = cursor.setdefault(part, {})
+        cursor[parts[-1]] = info
+    lines = render(tree)
+    if len(files) > len(visible):
+        lines.append(f"... {len(files) - len(visible)} more indexed files omitted")
+    return lines
+
+
+def component_lines(files: list[FileInfo]) -> list[str]:
+    groups: dict[str, list[FileInfo]] = {}
+    for info in files:
+        component = info.path.split("/", 1)[0]
+        groups.setdefault(component, []).append(info)
+    role_hints = {
+        "api": "request boundary", "app": "application", "apps": "applications",
+        "cli": "command-line interface", "config": "configuration", "docs": "documentation",
+        "models": "domain or data models", "scripts": "automation", "src": "main source",
+        "test": "tests", "tests": "tests", "web": "web interface",
+    }
+    lines = []
+    for name, items in sorted(groups.items(), key=lambda item: (-len(item[1]), item[0])):
+        languages = ", ".join(sorted({item.language for item in items}))
+        hint = role_hints.get(name.lower(), "project component")
+        lines.append(f"- `{name}`: {hint}; {len(items)} indexed file(s); {languages}")
+    return lines
+
+
+def dependency_trees(edges: list[tuple[str, str]], entry_points: list[str]) -> list[str]:
+    graph: dict[str, set[str]] = {}
+    incoming: dict[str, int] = {}
+    for source, target in edges:
+        graph.setdefault(source, set()).add(target)
+        incoming[target] = incoming.get(target, 0) + 1
+        incoming.setdefault(source, incoming.get(source, 0))
+    roots = sorted(set(entry_points) | {
+        node for node, count in incoming.items() if count == 0
+    })
+    if not roots:
+        roots = sorted(graph)[:10]
+
+    rendered = 0
+
+    def walk(node: str, prefix: str, ancestors: frozenset[str], depth: int) -> list[str]:
+        nonlocal rendered
+        if depth >= MAX_DEPENDENCY_DEPTH:
+            return [f"{prefix}... depth limit reached"]
+        children = sorted(graph.get(node, set()))
+        lines = []
+        for index, child in enumerate(children):
+            if rendered >= MAX_DEPENDENCY_NODES:
+                lines.append(f"{prefix}... dependency tree limit reached")
+                break
+            last = index == len(children) - 1
+            branch = "└── " if last else "├── "
+            suffix = " (cycle)" if child in ancestors else ""
+            lines.append(f"{prefix}{branch}{child}{suffix}")
+            rendered += 1
+            if child not in ancestors:
+                continuation = "    " if last else "│   "
+                lines.extend(walk(
+                    child, prefix + continuation, ancestors | {child}, depth + 1
+                ))
+        return lines
+
+    lines = []
+    for root in roots[:20]:
+        if rendered >= MAX_DEPENDENCY_NODES:
+            lines.append("... dependency tree limit reached")
+            break
+        lines.append(root)
+        rendered += 1
+        lines.extend(walk(root, "", frozenset({root}), 0))
+    return lines
+
+
+def hotspot_lines(edges: list[tuple[str, str]]) -> list[str]:
+    dependents: dict[str, set[str]] = {}
+    for source, target in edges:
+        dependents.setdefault(target, set()).add(source)
+    ranked = sorted(dependents.items(), key=lambda item: (-len(item[1]), item[0]))
+    return [
+        f"- `{target}`: imported by {len(sources)} indexed module(s)"
+        for target, sources in ranked[:20]
+    ]
+
+
+def build_map(root: Path, files: list[FileInfo], generated_at: str, commit: str | None,
+              versions: dict[str, str]) -> str:
+    known = {item.path for item in files}
+    edges = []
+    for info in files:
+        for imported in info.imports:
+            target = rel_import(info.path, imported, known)
+            if target and target != info.path:
+                edges.append((info.path, target))
+    entry_points = []
+    for info in files:
+        name = Path(info.path).name
+        if name in {"__main__.py", "manage.py", "main.py", "app.py", "cli.py", "index.js", "index.ts"}:
+            entry_points.append(info.path)
+
+    fingerprint = source_fingerprint(files)
+    meta = {
+        "analyzer": ANALYZER_VERSION,
+        "generated_at": generated_at,
+        "git_commit": commit,
+        "source_fingerprint": fingerprint,
+    }
+    lines = [
+        "# Project Map", "", 
+        f"<!-- project-map: {json.dumps(meta, sort_keys=True)} -->",
+        "This is a generated navigation index. Validate it before relying on it; read source files before editing.", "",
+        "## Snapshot", "",
+        f"- Analyzer: `{ANALYZER_VERSION}`",
+        f"- Generated (UTC): `{generated_at}`",
+        f"- Git commit: `{commit or 'not a Git repository'}`",
+        f"- Source fingerprint: `{fingerprint}`",
+        f"- Indexed files: `{len(files)}`",
+        f"- Declared project versions: `{json.dumps(versions, sort_keys=True) if versions else 'none detected'}`",
+        "- Source hashes: `.codex/project-map.manifest.json`", "",
+        "## Components", "", *component_lines(files), "",
+        "## Repository Tree", "", "```text",
+        *tree_lines(root, files), "```", "",
+        "## Entry Points", "",
+    ]
+    if entry_points:
+        lines.extend(f"- `{item}`" for item in sorted(set(entry_points)))
+    else:
+        lines.append("- No conventional entry point detected.")
+    lines.extend(["", "## Module Relationships", ""])
+    if edges:
+        unique_edges = sorted(set(edges))
+        lines.extend(
+            f"- `{source}` -> `{target}`"
+            for source, target in unique_edges[:MAX_RELATIONSHIPS]
+        )
+        if len(unique_edges) > MAX_RELATIONSHIPS:
+            lines.append(
+                f"- ... {len(unique_edges) - MAX_RELATIONSHIPS} more relationships omitted"
+            )
+    else:
+        lines.append("- No local import relationships resolved.")
+    lines.extend(["", "## Dependency Trees", "", "```text"])
+    lines.extend(dependency_trees(sorted(set(edges)), entry_points) or [
+        "No dependency tree detected."
+    ])
+    lines.extend(["```", "", "## Change Hotspots", ""])
+    lines.extend(hotspot_lines(edges) or ["- No imported local modules detected."])
+    lines.extend(["", "## Symbols", ""])
+    remaining_symbols = MAX_SYMBOLS
+    for info in files:
+        if remaining_symbols <= 0:
+            break
+        if not info.symbols and not info.parse_error:
+            continue
+        lines.append(f"### `{info.path}`")
+        if info.parse_error:
+            lines.append(f"- Parse warning: `{info.parse_error}`")
+        for symbol in info.symbols[:remaining_symbols]:
+            lines.extend(render_symbol(symbol))
+        remaining_symbols -= len(info.symbols)
+        lines.append("")
+    total_symbols = sum(len(info.symbols) for info in files)
+    if total_symbols > MAX_SYMBOLS:
+        lines.append(f"_... {total_symbols - MAX_SYMBOLS} more top-level symbols omitted._")
+        lines.append("")
+    lines.extend([
+        "## Change Guide", "",
+        "1. Run `project_map.py check .` after changing branches or before structural edits.",
+        "2. Use the tree and relationships to find candidate modules, then read those files directly.",
+        "3. Regenerate this map after imports, public symbols, entry points, or project layout change.",
+        "4. Treat a stale or unknown snapshot as untrusted.", "",
+    ])
+    return "\n".join(lines)
+
+
+def manifest_for(root: Path, files: list[FileInfo], generated_at: str, commit: str | None,
+                 versions: dict[str, str]) -> dict:
+    return {
+        "analyzer": ANALYZER_VERSION,
+        "generated_at": generated_at,
+        "git_commit": commit,
+        "source_fingerprint": source_fingerprint(files),
+        "project_versions": versions,
+        "project": root.name,
+        "files": {item.path: {"sha256": item.digest, "size": item.size} for item in files},
+    }
+
+
+def output_paths(root: Path, output: str | None) -> tuple[Path, Path]:
+    map_path = (root / output) if output else root / DEFAULT_MAP
+    manifest_path = map_path.with_name("project-map.manifest.json")
+    return map_path, manifest_path
+
+
+def generate(root: Path, output: str | None) -> int:
+    root = root.resolve()
+    files = [analyze_file(root, path) for path in discover_files(root)]
+    generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    commit = git_commit(root)
+    versions = project_versions(root)
+    map_path, manifest_path = output_paths(root, output)
+    map_path.parent.mkdir(parents=True, exist_ok=True)
+    map_path.write_text(build_map(root, files, generated_at, commit, versions) + "\n", encoding="utf-8")
+    manifest_path.write_text(json.dumps(manifest_for(root, files, generated_at, commit, versions), indent=2) + "\n", encoding="utf-8")
+    print(f"WROTE {map_path}")
+    print(f"WROTE {manifest_path}")
+    print(f"INDEXED {len(files)} files")
+    return 0
+
+
+def parse_map_meta(map_path: Path) -> dict | None:
+    if not map_path.is_file():
+        return None
+    match = re.search(r"<!-- project-map: (\{.*?\}) -->", map_path.read_text(encoding="utf-8", errors="replace"))
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+
+
+def validate(root: Path, output: str | None) -> int:
+    root = root.resolve()
+    map_path, manifest_path = output_paths(root, output)
+    if not map_path.is_file() or not manifest_path.is_file():
+        print(f"MISSING: generate {map_path}")
+        return 2
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"UNKNOWN: invalid manifest ({error})")
+        return 2
+    meta = parse_map_meta(map_path)
+    if not meta or meta.get("analyzer") != ANALYZER_VERSION:
+        print("STALE: map metadata is missing or analyzer version changed")
+        return 1
+    current_versions = project_versions(root)
+    if manifest.get("project_versions", {}) != current_versions:
+        print(f"STALE: declared project versions changed ({manifest.get('project_versions', {})} -> {current_versions})")
+        return 1
+    expected = manifest.get("files", {})
+    current = {path.relative_to(root).as_posix(): path for path in discover_files(root)}
+    changed = []
+    for path, record in expected.items():
+        if path not in current or digest(current[path]) != record.get("sha256"):
+            changed.append(path)
+    changed.extend(path for path in current if path not in expected)
+    if changed:
+        print(f"STALE: {len(changed)} indexed file(s) changed")
+        for path in sorted(changed)[:20]:
+            print(f"  {path}")
+        return 1
+    current_infos = [analyze_file(root, path) for path in current.values()]
+    current_fingerprint = source_fingerprint(current_infos)
+    if manifest.get("source_fingerprint") != current_fingerprint or \
+            meta.get("source_fingerprint") != current_fingerprint:
+        print("STALE: source fingerprint does not match the map and manifest")
+        return 1
+    current_commit = git_commit(root)
+    print(f"FRESH: {map_path} matches {len(expected)} indexed files at {current_commit or 'working tree'}")
+    return 0
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    for command in ("map", "check"):
+        sub = subparsers.add_parser(command)
+        sub.add_argument("root", nargs="?", default=".")
+        sub.add_argument("--output", help="Markdown path relative to root")
+    args = parser.parse_args(argv)
+    root = Path(args.root)
+    if not root.is_dir():
+        parser.error(f"not a directory: {root}")
+    return generate(root, args.output) if args.command == "map" else validate(root, args.output)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

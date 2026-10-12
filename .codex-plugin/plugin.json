@@ -1,0 +1,6 @@
+{
+  "name": "project-map",
+  "version": "0.1.0",
+  "description": "Build and validate a token-efficient architecture map for an existing codebase.",
+  "skills": "./skills/"
+}
