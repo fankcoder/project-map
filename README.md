@@ -31,7 +31,7 @@ The skill can also be discovered automatically when Codex needs to understand an
 
 1. Open the target repository in Codex and start a new session after installing or updating the plugin.
 2. Begin with: `Use $project-map to inspect this repository before making changes.`
-3. Ask Codex to summarize the map's Snapshot, Changes Since Previous Map, Components, and Entry Points sections first.
+3. Ask Codex to summarize the map's Snapshot, Coverage, Changes Since Previous Map, Components, and Entry Points sections first.
 4. For a focused task, name the feature or path: `Use the project map to locate the authentication flow, then read the current source and tests.`
 5. Before structural edits, ask Codex to validate the map and update it if stale.
 6. After a branch switch, rebase, or substantial code change, ask: `Run the project map update, summarize added/changed/removed files, then continue.`
@@ -57,7 +57,15 @@ python3 scripts/project_map.py update /path/to/repository
 python3 scripts/project_map.py check /path/to/repository
 ```
 
-The default outputs are `.codex/project-map.md` and `.codex/project-map.manifest.json` inside the target repository. Add the `.codex/` files to `.gitignore` if the map is personal, or commit them when a team wants a shared orientation document.
+The default outputs are `.project-map/project-map.md` and `.project-map/project-map.manifest.json` inside the target repository. Project Map avoids `.codex/` because some Codex hosts reserve or remap that directory. Add `.project-map/` to `.gitignore` if the map is personal, or commit it when a team wants a shared orientation document.
+
+To use another location, pass the same `--output` value to every command:
+
+```bash
+python3 scripts/project_map.py map /path/to/repository --output output/project-map.md
+python3 scripts/project_map.py update /path/to/repository --output output/project-map.md
+python3 scripts/project_map.py check /path/to/repository --output output/project-map.md
+```
 
 The generated Markdown is deliberately bounded for token efficiency. It summarizes components, a filtered tree, entry points, local dependency trees, change hotspots, and public symbols. The manifest still hashes every indexed source file so omitted display details cannot hide staleness.
 
@@ -68,11 +76,13 @@ The generated Markdown is deliberately bounded for token efficiency. It summariz
 - Git-tracked files when the target is a Git repository, with a safe filesystem fallback.
 - Python modules, imports, classes, functions, methods, docstrings, and line ranges via `ast`.
 - JavaScript and TypeScript imports, exports, classes, functions, and line ranges using conservative standard-library parsing.
+- Shell files (`.sh`, `.bash`, `.zsh`, `.fish`, plus extensionless shell shebang files), functions, sourced files, and direct local script execution using conservative parsing.
+- systemd units (`.service`, `.socket`, `.timer`, `.target`, `.mount`, `.path`), sections, local unit relationships, and referenced project scripts using conservative parsing.
 - Common project metadata such as `pyproject.toml`, `package.json`, `Cargo.toml`, `manage.py`, and `__main__.py`.
 - A manifest containing analyzer version, Git commit, file hashes, reusable analysis, and generated timestamp.
 - Declared project versions from `pyproject.toml`, `package.json`, or `Cargo.toml` when present.
 
-The map is a navigation index. The validator deliberately reports stale data instead of silently trusting it.
+The map is a navigation index. `FRESH` means every file listed in the map and manifest still matches; it does not mean every file in the repository is indexed. The generated Coverage section states the exact indexed languages and the parser's limits. The validator deliberately reports stale indexed data instead of silently trusting it.
 
 ## Roadmap
 

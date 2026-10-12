@@ -31,7 +31,7 @@ codex plugin marketplace list
 
 1. 在 Codex 中打开目标仓库；安装或更新插件后开启新的会话。
 2. 首条消息使用：`使用 $project-map 在修改前检查这个仓库。`
-3. 先让 Codex 总结地图中的 Snapshot、Changes Since Previous Map、Components 和 Entry Points。
+3. 先让 Codex 总结地图中的 Snapshot、Coverage、Changes Since Previous Map、Components 和 Entry Points。
 4. 对于具体任务，给出功能或路径，例如：`使用项目地图定位认证流程，然后读取当前源码和测试。`
 5. 进行结构性修改前，让 Codex 再次验证地图，过期时执行更新。
 6. 切换分支、rebase 或完成较大改动后，发送：`更新项目地图，先总结新增、变化和删除的文件，再继续任务。`
@@ -60,11 +60,19 @@ python3 scripts/project_map.py check /path/to/repository
 默认输出位于目标仓库内：
 
 ```text
-.codex/project-map.md
-.codex/project-map.manifest.json
+.project-map/project-map.md
+.project-map/project-map.manifest.json
 ```
 
-如果地图仅供个人使用，可以把这些 `.codex/` 文件加入 `.gitignore`；如果团队需要共享项目导航文档，也可以将它们提交到仓库。
+Project Map 不再使用 `.codex/`，因为部分 Codex 宿主会保留或重映射这个目录。如果地图仅供个人使用，可以把 `.project-map/` 加入 `.gitignore`；如果团队需要共享项目导航文档，也可以将它提交到仓库。
+
+如需使用其他输出位置，三条命令必须传入相同的 `--output`：
+
+```bash
+python3 scripts/project_map.py map /path/to/repository --output output/project-map.md
+python3 scripts/project_map.py update /path/to/repository --output output/project-map.md
+python3 scripts/project_map.py check /path/to/repository --output output/project-map.md
+```
 
 生成的 Markdown 会限制内容规模以节省 token，其中包含组件概览、经过过滤的文件树、入口点、本地依赖树、修改热点和公开符号。即使部分展示内容因上限被省略，manifest 仍会记录每个已索引源码文件的哈希，因此不会因省略内容而漏掉过期状态。
 
@@ -75,11 +83,13 @@ python3 scripts/project_map.py check /path/to/repository
 - Git 仓库优先分析 Git 跟踪的文件；非 Git 项目会安全地回退到文件系统扫描。
 - 通过 `ast` 分析 Python 模块、导入、类、函数、方法、文档字符串和行号范围。
 - 使用保守的标准库解析方式分析 JavaScript 和 TypeScript 的导入、导出、类、函数和行号。
+- 使用保守解析分析 Shell 文件（`.sh`、`.bash`、`.zsh`、`.fish` 以及带 Shell shebang 的无扩展名文件）、函数、source 引用和直接执行的本地脚本。
+- 使用保守解析分析 systemd 单元（`.service`、`.socket`、`.timer`、`.target`、`.mount`、`.path`）的 section、本地单元依赖和项目脚本引用。
 - 识别 `pyproject.toml`、`package.json`、`Cargo.toml`、`manage.py` 和 `__main__.py` 等常见项目元数据及入口文件。
 - manifest 保存分析器版本、Git commit、文件哈希、可复用的分析缓存和生成时间。
 - 在存在声明版本时读取 `pyproject.toml`、`package.json` 或 `Cargo.toml` 中的项目版本。
 
-项目地图是导航索引，不是源码事实的替代品。验证器发现变化时会明确报告地图已经过期，而不会继续静默信任旧内容。实际修改代码前，仍应读取地图指向的当前源码文件。
+项目地图是导航索引，不是源码事实的替代品。`FRESH` 只表示地图和 manifest 列出的文件仍然匹配，并不表示仓库内每个文件都已建立索引。生成文档中的 Coverage 会列出实际语言数量、发现范围和解析限制。验证器发现已索引内容变化时会明确报告地图已经过期，而不会继续静默信任旧内容。实际修改代码前，仍应读取地图指向的当前源码文件。
 
 ## 后续规划
 

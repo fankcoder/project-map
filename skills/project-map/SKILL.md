@@ -9,7 +9,7 @@ This skill keeps a compact, local architecture map for an existing repository. I
 
 ## Before editing
 
-1. Resolve the plugin root as two directories above this `SKILL.md`, then run:
+1. Start from the actual loaded `SKILL.md`. Set the skill directory to its parent, then set the plugin root to the skill directory's second parent (`<plugin-root>/skills/project-map/SKILL.md`). Compute this once; do not append `skills/project-map` again. Then run:
 
    ```bash
    python3 "<plugin-root>/scripts/project_map.py" check .
@@ -27,7 +27,7 @@ This skill keeps a compact, local architecture map for an existing repository. I
    python3 "<plugin-root>/scripts/project_map.py" update .
    ```
 
-3. Read the Snapshot, Changes Since Previous Map (when present), Components, and Entry Points sections of `.codex/project-map.md` first. Search within the map for relevant paths or symbols and load only the matching sections. Read the entire map only when the task genuinely requires repository-wide understanding.
+3. Read the Snapshot, Coverage, Changes Since Previous Map (when present), Components, and Entry Points sections of `.project-map/project-map.md` first. Search within the map for relevant paths or symbols and load only the matching sections. Read the entire map only when the task genuinely requires repository-wide understanding.
 
 4. Read the current source files named by the map before modifying them. The map identifies likely relationships; it does not prove behavior.
 
@@ -37,9 +37,10 @@ This skill keeps a compact, local architecture map for an existing repository. I
 - Run `update` after source changes. It reuses cached analysis only when file hashes still match.
 - Do not hand-edit the generated map. It contains a manifest of source hashes and the Git commit used to build it.
 - Treat `UNKNOWN` and `STALE` results as a stop for architectural edits until the map is regenerated.
+- Treat `FRESH` as confirmation that indexed files match the manifest, not proof that every repository file is covered. Review the Coverage section before relying on the map.
 
 ## What the generator records
 
-The generator is local-only and uses Python's standard library. It records a filtered file tree, Python and JavaScript/TypeScript symbols, import edges, likely entry points, per-file SHA-256 hashes, and reusable per-file analysis. Incremental updates use Git commits to identify expected changes and hash every indexed file before reusing cached analysis. It does not execute project code, install packages, call an API, or upload source files.
+The generator is local-only and uses Python's standard library. It records a filtered file tree, Python and JavaScript/TypeScript symbols, conservative Shell functions and script relationships, systemd sections and unit/script relationships, likely entry points, per-file SHA-256 hashes, and reusable per-file analysis. Incremental updates use Git commits to identify expected changes and hash every indexed file before reusing cached analysis. It does not execute project code, install packages, call an API, or upload source files.
 
 When reporting a change, cite the source path and line number rather than treating a map summary as evidence.

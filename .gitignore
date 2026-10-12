@@ -1,4 +1,5 @@
 __pycache__/
 .pytest_cache/
+.project-map/
 .codex/project-map.md
 .codex/project-map.manifest.json
