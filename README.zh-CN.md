@@ -6,18 +6,48 @@ Project Map 是一个本地 Codex 插件，用于帮助智能体快速熟悉陌�
 
 分析器仅使用 Python 标准库，不依赖第三方包，也不会导入或执行目标项目代码。
 
-## 在 Codex 中安装
+## 在 Codex 中安装和使用
 
-本仓库在 `.agents/plugins/marketplace.json` 中提供了一个仓库级 marketplace。克隆仓库后，注册这个本地 marketplace：
+Project Map 是一个只包含 Skill 的插件：在本地运行，不需要 API key 或 MCP 连接，也不会上传源码。常规 GitHub 安装方式是注册仓库 marketplace：
+
+```bash
+codex plugin marketplace add fankcoder/project-map
+codex plugin marketplace list
+```
+
+启动 `codex`，输入 `/plugins`，选择 **Project Map Development** 并安装 `project-map`。安装或更新插件后需要开启一个新的 Codex 会话，Codex 才会发现插件包含的技能。目前 Codex CLI 和 ChatGPT 桌面应用支持插件，IDE 扩展暂不支持。
+
+发布新版本后，可以运行 `codex plugin marketplace upgrade project-map-local` 刷新 marketplace，再进入 `/plugins` 检查插件，并重新开启一个新会话。
+
+在希望 Codex 修改的项目中，可以直接发送：
+
+```text
+使用 $project-map 熟悉当前仓库，先验证或更新项目地图，再解释相关架构，然后开始修改。
+```
+
+插件也可以在 Codex 需要理解陌生仓库时自动触发。它会先验证已有地图，过期时进行增量更新，并且在修改前要求读取当前源码。需要稳定、明确地触发时，使用 `$project-map`。
+
+### 推荐的 Codex 工作流
+
+1. 在 Codex 中打开目标仓库；安装或更新插件后开启新的会话。
+2. 首条消息使用：`使用 $project-map 在修改前检查这个仓库。`
+3. 先让 Codex 总结地图中的 Snapshot、Changes Since Previous Map、Components 和 Entry Points。
+4. 对于具体任务，给出功能或路径，例如：`使用项目地图定位认证流程，然后读取当前源码和测试。`
+5. 进行结构性修改前，让 Codex 再次验证地图，过期时执行更新。
+6. 切换分支、rebase 或完成较大改动后，发送：`更新项目地图，先总结新增、变化和删除的文件，再继续任务。`
+
+项目地图是缩小搜索范围的导航索引，不是源码审查的替代品。好的提示词应该要求 Codex 先使用地图定位，再回读当前源码和测试确认行为。
+
+### 本地开发和测试插件
+
+如果要测试本地 checkout，而不是 GitHub 版本：
 
 ```bash
 codex plugin marketplace add /absolute/path/to/project-map
 codex plugin marketplace list
 ```
 
-启动 `codex`，输入 `/plugins`，选择 **Project Map Development** 并安装 `project-map`。安装后需要开启一个新的 Codex 会话，Codex 才会发现插件包含的技能。目前 Codex CLI 和 ChatGPT 桌面应用支持插件，IDE 扩展暂不支持。
-
-安装后可以通过 `$project-map` 明确调用，也可以在 Codex 需要理解陌生仓库时由其自动发现。插件会先验证已有地图，只有地图过期时才在架构分析前重新生成。
+进入 `/plugins`，安装本地的 **Project Map Development**，修改插件文件后重新开启 Codex 会话。
 
 ## 直接使用命令行
 
@@ -50,6 +80,17 @@ python3 scripts/project_map.py check /path/to/repository
 - 在存在声明版本时读取 `pyproject.toml`、`package.json` 或 `Cargo.toml` 中的项目版本。
 
 项目地图是导航索引，不是源码事实的替代品。验证器发现变化时会明确报告地图已经过期，而不会继续静默信任旧内容。实际修改代码前，仍应读取地图指向的当前源码文件。
+
+## 后续规划
+
+当前版本重点是可信、低成本的项目地图。后续建议拆成独立工作流，而不是把所有功能塞进一个庞大的 Skill：
+
+- 按任务生成 context pack，只返回与请求相关的模块、符号、测试和依赖。
+- 影响分析，列出反向依赖、可能的入口、受影响测试和修改风险。
+- 分层 Markdown 地图，先读取小型索引，需要时再打开组件详情。
+- 架构规则，在 CI 或结构性修改前检测禁止的依赖方向。
+
+以上是后续设计方向，不代表当前版本已经提供这些功能。
 
 ## 插件目录结构
 

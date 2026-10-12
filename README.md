@@ -6,18 +6,48 @@ Project Map is a local Codex plugin for quickly orienting an agent in an unfamil
 
 It is intentionally dependency-free: the analyzer uses only Python's standard library and never imports or executes the target project.
 
-## Install for Codex
+## Install and use in Codex
 
-This repository includes a repo marketplace at `.agents/plugins/marketplace.json`. After cloning it, register that local marketplace:
+Project Map is a skill-only plugin: it runs locally, needs no API key or MCP connection, and never uploads source code. For the normal GitHub installation, register the repository marketplace:
+
+```bash
+codex plugin marketplace add fankcoder/project-map
+codex plugin marketplace list
+```
+
+Start `codex`, enter `/plugins`, choose **Project Map Development**, and install `project-map`. Start a new Codex session after installation so the bundled skill is discovered. Codex plugins are currently supported in Codex CLI and the ChatGPT desktop app, not the IDE extension.
+
+To refresh the marketplace after a new release, run `codex plugin marketplace upgrade project-map-local`, review the plugin in `/plugins`, and start another new session.
+
+In a repository you want Codex to modify, ask directly:
+
+```text
+Use $project-map to orient yourself in this repository, validate or update the project map, then explain the relevant architecture before editing.
+```
+
+The skill can also be discovered automatically when Codex needs to understand an unfamiliar repository. It validates an existing map before reading it, updates stale maps incrementally, and still requires current source files to be read before edits. Use `$project-map` when you want deterministic activation.
+
+### Recommended Codex workflow
+
+1. Open the target repository in Codex and start a new session after installing or updating the plugin.
+2. Begin with: `Use $project-map to inspect this repository before making changes.`
+3. Ask Codex to summarize the map's Snapshot, Changes Since Previous Map, Components, and Entry Points sections first.
+4. For a focused task, name the feature or path: `Use the project map to locate the authentication flow, then read the current source and tests.`
+5. Before structural edits, ask Codex to validate the map and update it if stale.
+6. After a branch switch, rebase, or substantial code change, ask: `Run the project map update, summarize added/changed/removed files, then continue.`
+
+The map is a navigation index, not a replacement for source review. A good prompt asks Codex to use the map to narrow the search, then verify behavior in the current source and tests.
+
+### Local plugin testing
+
+To develop or test a local checkout instead of the GitHub version:
 
 ```bash
 codex plugin marketplace add /absolute/path/to/project-map
 codex plugin marketplace list
 ```
 
-Start `codex`, enter `/plugins`, choose **Project Map Development**, and install `project-map`. Start a new Codex session after installation so the bundled skill is discovered. Codex plugins are currently supported in Codex CLI and the ChatGPT desktop app, not the IDE extension.
-
-The plugin can then be selected explicitly with `$project-map`, or discovered automatically when Codex needs to understand an unfamiliar repository. It validates an existing map before reading it and regenerates stale maps before architectural work.
+Open `/plugins`, install the local **Project Map Development** entry, and start a new session after changing plugin files.
 
 ## Direct CLI use
 
@@ -43,6 +73,17 @@ The generated Markdown is deliberately bounded for token efficiency. It summariz
 - Declared project versions from `pyproject.toml`, `package.json`, or `Cargo.toml` when present.
 
 The map is a navigation index. The validator deliberately reports stale data instead of silently trusting it.
+
+## Roadmap
+
+The current release focuses on a trustworthy, low-cost project map. The next useful capabilities are planned as separate workflows rather than one oversized skill:
+
+- Task-focused context packs that return only the modules, symbols, tests, and dependencies relevant to a request.
+- Impact analysis that lists reverse dependents, likely entry points, affected tests, and change risk.
+- Layered Markdown maps so a session can load a small index first and open component details only when needed.
+- Architecture rules that detect forbidden dependency directions in CI or before a structural edit.
+
+These are design directions, not features provided by the current release.
 
 ## Plugin layout
 
