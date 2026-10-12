@@ -23,6 +23,7 @@ The plugin can then be selected explicitly with `$project-map`, or discovered au
 
 ```bash
 python3 scripts/project_map.py map /path/to/repository
+python3 scripts/project_map.py update /path/to/repository
 python3 scripts/project_map.py check /path/to/repository
 ```
 
@@ -30,13 +31,15 @@ The default outputs are `.codex/project-map.md` and `.codex/project-map.manifest
 
 The generated Markdown is deliberately bounded for token efficiency. It summarizes components, a filtered tree, entry points, local dependency trees, change hotspots, and public symbols. The manifest still hashes every indexed source file so omitted display details cannot hide staleness.
 
+`update` compares the Git commit and working tree with the previous manifest, verifies content with SHA-256, reparses only changed or added files, and reuses cached analysis for unchanged files. The refreshed map includes a compact summary of files added, changed, or removed since the previous map. If the cache is missing or incompatible, it safely falls back to a full generation.
+
 ## Supported evidence
 
 - Git-tracked files when the target is a Git repository, with a safe filesystem fallback.
 - Python modules, imports, classes, functions, methods, docstrings, and line ranges via `ast`.
 - JavaScript and TypeScript imports, exports, classes, functions, and line ranges using conservative standard-library parsing.
 - Common project metadata such as `pyproject.toml`, `package.json`, `Cargo.toml`, `manage.py`, and `__main__.py`.
-- A manifest containing analyzer version, Git commit, file hashes, and generated timestamp.
+- A manifest containing analyzer version, Git commit, file hashes, reusable analysis, and generated timestamp.
 - Declared project versions from `pyproject.toml`, `package.json`, or `Cargo.toml` when present.
 
 The map is a navigation index. The validator deliberately reports stale data instead of silently trusting it.

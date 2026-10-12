@@ -23,6 +23,7 @@ codex plugin marketplace list
 
 ```bash
 python3 scripts/project_map.py map /path/to/repository
+python3 scripts/project_map.py update /path/to/repository
 python3 scripts/project_map.py check /path/to/repository
 ```
 
@@ -37,13 +38,15 @@ python3 scripts/project_map.py check /path/to/repository
 
 生成的 Markdown 会限制内容规模以节省 token，其中包含组件概览、经过过滤的文件树、入口点、本地依赖树、修改热点和公开符号。即使部分展示内容因上限被省略，manifest 仍会记录每个已索引源码文件的哈希，因此不会因省略内容而漏掉过期状态。
 
+`update` 会将当前 Git commit 和工作区与上一次 manifest 进行比较，再用 SHA-256 验证文件内容。它只重新解析新增或变化的文件，并复用未变化文件的分析缓存。更新后的地图还会简要列出自上次生成以来新增、变化和删除的文件。如果缓存缺失或版本不兼容，命令会安全地回退到完整生成。
+
 ## 支持的分析信息
 
 - Git 仓库优先分析 Git 跟踪的文件；非 Git 项目会安全地回退到文件系统扫描。
 - 通过 `ast` 分析 Python 模块、导入、类、函数、方法、文档字符串和行号范围。
 - 使用保守的标准库解析方式分析 JavaScript 和 TypeScript 的导入、导出、类、函数和行号。
 - 识别 `pyproject.toml`、`package.json`、`Cargo.toml`、`manage.py` 和 `__main__.py` 等常见项目元数据及入口文件。
-- manifest 保存分析器版本、Git commit、文件哈希和生成时间。
+- manifest 保存分析器版本、Git commit、文件哈希、可复用的分析缓存和生成时间。
 - 在存在声明版本时读取 `pyproject.toml`、`package.json` 或 `Cargo.toml` 中的项目版本。
 
 项目地图是导航索引，不是源码事实的替代品。验证器发现变化时会明确报告地图已经过期，而不会继续静默信任旧内容。实际修改代码前，仍应读取地图指向的当前源码文件。

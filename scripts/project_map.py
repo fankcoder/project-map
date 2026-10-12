@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-ANALYZER_VERSION = "0.1.0"
+ANALYZER_VERSION = "0.2.0"
 DEFAULT_MAP = Path(".codex/project-map.md")
 DEFAULT_MANIFEST = Path(".codex/project-map.manifest.json")
 MAX_TREE_FILES = 500
@@ -58,6 +58,85 @@ class FileInfo:
     imports: list[str] = field(default_factory=list)
     symbols: list[Symbol] = field(default_factory=list)
     parse_error: str | None = None
+
+
+def symbol_to_record(symbol: Symbol) -> dict:
+    return {
+        "kind": symbol.kind,
+        "name": symbol.name,
+        "line": symbol.line,
+        "end_line": symbol.end_line,
+        "children": [symbol_to_record(child) for child in symbol.children],
+        "doc": symbol.doc,
+    }
+
+
+def symbol_from_record(record: object) -> Symbol | None:
+    if not isinstance(record, dict):
+        return None
+    kind = record.get("kind")
+    name = record.get("name")
+    line = record.get("line")
+    end_line = record.get("end_line")
+    children = record.get("children", [])
+    doc = record.get("doc", "")
+    if not (
+        isinstance(kind, str)
+        and isinstance(name, str)
+        and isinstance(line, int)
+        and isinstance(end_line, int)
+        and isinstance(children, list)
+        and isinstance(doc, str)
+    ):
+        return None
+    converted_children = [symbol_from_record(child) for child in children]
+    if any(child is None for child in converted_children):
+        return None
+    return Symbol(kind, name, line, end_line, converted_children, doc)
+
+
+def file_to_record(info: FileInfo) -> dict:
+    return {
+        "sha256": info.digest,
+        "size": info.size,
+        "language": info.language,
+        "imports": info.imports,
+        "symbols": [symbol_to_record(symbol) for symbol in info.symbols],
+        "parse_error": info.parse_error,
+    }
+
+
+def file_from_record(path: str, record: object) -> FileInfo | None:
+    if not isinstance(record, dict):
+        return None
+    digest_value = record.get("sha256")
+    size = record.get("size")
+    language = record.get("language")
+    imports = record.get("imports")
+    symbols = record.get("symbols")
+    parse_error = record.get("parse_error")
+    if not (
+        isinstance(digest_value, str)
+        and isinstance(size, int)
+        and isinstance(language, str)
+        and isinstance(imports, list)
+        and all(isinstance(item, str) for item in imports)
+        and isinstance(symbols, list)
+        and (parse_error is None or isinstance(parse_error, str))
+    ):
+        return None
+    converted_symbols = [symbol_from_record(symbol) for symbol in symbols]
+    if any(symbol is None for symbol in converted_symbols):
+        return None
+    return FileInfo(
+        path,
+        size,
+        digest_value,
+        language,
+        list(imports),
+        converted_symbols,
+        parse_error,
+    )
 
 
 def run_git(root: Path, *args: str) -> str | None:
@@ -251,6 +330,34 @@ def git_commit(root: Path) -> str | None:
     return run_git(root, "rev-parse", "HEAD")
 
 
+def git_change_candidates(
+    root: Path, previous_commit: object, current_commit: str | None
+) -> set[str] | None:
+    """Return paths Git says may differ, including working tree changes."""
+    if not isinstance(previous_commit, str) or not current_commit:
+        return None
+    committed = run_git(
+        root, "diff", "--name-only", "--no-renames", previous_commit,
+        current_commit, "--",
+    )
+    working = run_git(
+        root, "status", "--porcelain=v1", "--untracked-files=all",
+    )
+    if committed is None or working is None:
+        return None
+    candidates = {line for line in committed.splitlines() if line}
+    for line in working.splitlines():
+        if len(line) < 4:
+            continue
+        path = line[3:]
+        if " -> " in path:
+            old_path, new_path = path.split(" -> ", 1)
+            candidates.update((old_path, new_path))
+        else:
+            candidates.add(path)
+    return candidates
+
+
 def rel_import(source: str, imported: str, known: set[str]) -> str | None:
     if not imported or imported.startswith(("@", "http")):
         return None
@@ -411,7 +518,7 @@ def hotspot_lines(edges: list[tuple[str, str]]) -> list[str]:
 
 
 def build_map(root: Path, files: list[FileInfo], generated_at: str, commit: str | None,
-              versions: dict[str, str]) -> str:
+              versions: dict[str, str], changes: dict | None = None) -> str:
     known = {item.path for item in files}
     edges = []
     for info in files:
@@ -443,12 +550,31 @@ def build_map(root: Path, files: list[FileInfo], generated_at: str, commit: str 
         f"- Source fingerprint: `{fingerprint}`",
         f"- Indexed files: `{len(files)}`",
         f"- Declared project versions: `{json.dumps(versions, sort_keys=True) if versions else 'none detected'}`",
-        "- Source hashes: `.codex/project-map.manifest.json`", "",
+        "- Source hashes and analysis cache: `.codex/project-map.manifest.json`", "",
+    ]
+    if changes is not None:
+        lines.extend([
+            "## Changes Since Previous Map", "",
+            f"- Previous Git commit: `{changes.get('from_commit') or 'unavailable'}`",
+            f"- Current Git commit: `{changes.get('to_commit') or 'working tree'}`",
+        ])
+        for label, key in (("Added", "added"), ("Changed", "changed"), ("Removed", "removed")):
+            values = changes.get(key, [])
+            lines.append(
+                f"- {label}: " + (
+                    ", ".join(f"`{value}`" for value in values[:20])
+                    if values else "none"
+                )
+            )
+            if len(values) > 20:
+                lines.append(f"  - ... {len(values) - 20} more")
+        lines.append("")
+    lines.extend([
         "## Components", "", *component_lines(files), "",
         "## Repository Tree", "", "```text",
         *tree_lines(root, files), "```", "",
         "## Entry Points", "",
-    ]
+    ])
     if entry_points:
         lines.extend(f"- `{item}`" for item in sorted(set(entry_points)))
     else:
@@ -494,7 +620,7 @@ def build_map(root: Path, files: list[FileInfo], generated_at: str, commit: str 
         "## Change Guide", "",
         "1. Run `project_map.py check .` after changing branches or before structural edits.",
         "2. Use the tree and relationships to find candidate modules, then read those files directly.",
-        "3. Regenerate this map after imports, public symbols, entry points, or project layout change.",
+        "3. Run `project_map.py update .` after source changes to reuse unchanged analysis.",
         "4. Treat a stale or unknown snapshot as untrusted.", "",
     ])
     return "\n".join(lines)
@@ -509,7 +635,7 @@ def manifest_for(root: Path, files: list[FileInfo], generated_at: str, commit: s
         "source_fingerprint": source_fingerprint(files),
         "project_versions": versions,
         "project": root.name,
-        "files": {item.path: {"sha256": item.digest, "size": item.size} for item in files},
+        "files": {item.path: file_to_record(item) for item in files},
     }
 
 
@@ -535,6 +661,94 @@ def generate(root: Path, output: str | None) -> int:
     return 0
 
 
+def load_manifest(manifest_path: Path) -> dict | None:
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return manifest if isinstance(manifest, dict) else None
+
+
+def update(root: Path, output: str | None) -> int:
+    root = root.resolve()
+    map_path, manifest_path = output_paths(root, output)
+    previous = load_manifest(manifest_path)
+    if not map_path.is_file() or previous is None:
+        print("NO CACHE: generating a full map")
+        return generate(root, output)
+
+    previous_files = previous.get("files", {})
+    if not isinstance(previous_files, dict):
+        print("INVALID CACHE: generating a full map")
+        return generate(root, output)
+
+    paths = discover_files(root)
+    current_paths = {
+        path.relative_to(root).as_posix(): path
+        for path in paths
+    }
+    current_commit = git_commit(root)
+    git_candidates = git_change_candidates(
+        root, previous.get("git_commit"), current_commit
+    )
+    if previous.get("analyzer") != ANALYZER_VERSION:
+        git_candidates = set(current_paths)
+    elif git_candidates is None:
+        git_candidates = set(current_paths)
+    git_candidates.update(set(current_paths) - set(previous_files))
+
+    files = []
+    reused = 0
+    reparsed = 0
+    added = sorted(set(current_paths) - set(previous_files))
+    removed = sorted(set(previous_files) - set(current_paths))
+    changed = []
+    for relative, path in sorted(current_paths.items()):
+        record = previous_files.get(relative)
+        cached = file_from_record(relative, record)
+        # Git narrows the expected change set, while hashing every indexed file
+        # protects against assume-unchanged flags and other hidden worktree edits.
+        current_digest = digest(path)
+        old_digest = record.get("sha256") if isinstance(record, dict) else None
+        if current_digest == old_digest and cached is not None:
+            files.append(cached)
+            reused += 1
+            continue
+        files.append(analyze_file(root, path))
+        reparsed += 1
+        if relative in previous_files and current_digest != old_digest:
+            changed.append(relative)
+
+    generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    versions = project_versions(root)
+    changes = {
+        "from_commit": previous.get("git_commit"),
+        "to_commit": current_commit,
+        "added": added,
+        "changed": sorted(changed),
+        "removed": removed,
+    }
+    map_path.parent.mkdir(parents=True, exist_ok=True)
+    map_path.write_text(
+        build_map(root, files, generated_at, current_commit, versions, changes) + "\n",
+        encoding="utf-8",
+    )
+    manifest_path.write_text(
+        json.dumps(
+            manifest_for(root, files, generated_at, current_commit, versions),
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    print(f"WROTE {map_path}")
+    print(f"WROTE {manifest_path}")
+    print(f"REUSED {reused} analyses")
+    print(f"REPARSED {reparsed} files")
+    print(f"REMOVED {len(removed)} files")
+    print(f"GIT CANDIDATES {len(git_candidates)} paths")
+    return 0
+
+
 def parse_map_meta(map_path: Path) -> dict | None:
     if not map_path.is_file():
         return None
@@ -554,9 +768,12 @@ def validate(root: Path, output: str | None) -> int:
         print(f"MISSING: generate {map_path}")
         return 2
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        manifest = load_manifest(manifest_path)
+    except OSError as error:
         print(f"UNKNOWN: invalid manifest ({error})")
+        return 2
+    if manifest is None:
+        print("UNKNOWN: invalid manifest")
         return 2
     meta = parse_map_meta(map_path)
     if not meta or meta.get("analyzer") != ANALYZER_VERSION:
@@ -569,16 +786,27 @@ def validate(root: Path, output: str | None) -> int:
     expected = manifest.get("files", {})
     current = {path.relative_to(root).as_posix(): path for path in discover_files(root)}
     changed = []
+    current_digests = {}
     for path, record in expected.items():
-        if path not in current or digest(current[path]) != record.get("sha256"):
+        if path not in current:
             changed.append(path)
-    changed.extend(path for path in current if path not in expected)
+            continue
+        current_digests[path] = digest(current[path])
+        if not isinstance(record, dict) or current_digests[path] != record.get("sha256"):
+            changed.append(path)
+    for path in current:
+        if path not in expected:
+            changed.append(path)
+            current_digests[path] = digest(current[path])
     if changed:
         print(f"STALE: {len(changed)} indexed file(s) changed")
         for path in sorted(changed)[:20]:
             print(f"  {path}")
         return 1
-    current_infos = [analyze_file(root, path) for path in current.values()]
+    current_infos = [
+        FileInfo(path, current[path].stat().st_size, digest_value, "")
+        for path, digest_value in current_digests.items()
+    ]
     current_fingerprint = source_fingerprint(current_infos)
     if manifest.get("source_fingerprint") != current_fingerprint or \
             meta.get("source_fingerprint") != current_fingerprint:
@@ -592,7 +820,7 @@ def validate(root: Path, output: str | None) -> int:
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("map", "check"):
+    for command in ("map", "update", "check"):
         sub = subparsers.add_parser(command)
         sub.add_argument("root", nargs="?", default=".")
         sub.add_argument("--output", help="Markdown path relative to root")
@@ -600,7 +828,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     root = Path(args.root)
     if not root.is_dir():
         parser.error(f"not a directory: {root}")
-    return generate(root, args.output) if args.command == "map" else validate(root, args.output)
+    if args.command == "map":
+        return generate(root, args.output)
+    if args.command == "update":
+        return update(root, args.output)
+    return validate(root, args.output)
 
 
 if __name__ == "__main__":

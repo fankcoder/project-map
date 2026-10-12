@@ -119,12 +119,14 @@ class ProjectMapTests(unittest.TestCase):
             manifest = json.loads(
                 (root / ".codex" / "project-map.manifest.json").read_text()
             )
-            self.assertEqual(manifest["analyzer"], "0.1.0")
+            self.assertEqual(manifest["analyzer"], "0.2.0")
             self.assertEqual(
                 manifest["project_versions"], {"pyproject.toml": "1.2.3"}
             )
             self.assertEqual(len(manifest["source_fingerprint"]), 64)
             self.assertTrue(manifest["files"]["main.py"]["sha256"])
+            self.assertEqual(manifest["files"]["main.py"]["language"], "python")
+            self.assertTrue(manifest["files"]["main.py"]["symbols"])
             (root / "pyproject.toml").write_text(
                 "[project]\nname = 'fixture'\nversion = '1.2.4'\n",
                 encoding="utf-8",
@@ -151,6 +153,122 @@ class ProjectMapTests(unittest.TestCase):
             stale = run("check", str(root))
             self.assertEqual(stale.returncode, 1)
             self.assertIn("source fingerprint does not match", stale.stdout)
+
+    def test_incremental_update_reuses_unchanged_analysis(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "one.py").write_text("def one():\n    return 1\n", encoding="utf-8")
+            (root / "two.py").write_text("def two():\n    return 2\n", encoding="utf-8")
+            self.assertEqual(run("map", str(root)).returncode, 0)
+
+            (root / "two.py").write_text("def changed():\n    return 3\n", encoding="utf-8")
+            (root / "three.py").write_text("def three():\n    return 3\n", encoding="utf-8")
+            updated = run("update", str(root))
+            self.assertEqual(updated.returncode, 0, updated.stderr)
+            self.assertIn("REUSED 1 analyses", updated.stdout)
+            self.assertIn("REPARSED 2 files", updated.stdout)
+
+            document = (root / ".codex" / "project-map.md").read_text()
+            self.assertIn("## Changes Since Previous Map", document)
+            self.assertIn("- Added: `three.py`", document)
+            self.assertIn("- Changed: `two.py`", document)
+            self.assertIn("`function changed`", document)
+            self.assertEqual(run("check", str(root)).returncode, 0)
+
+    def test_incremental_update_tracks_git_commits_and_removals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Test"],
+                check=True,
+            )
+            (root / "keep.py").write_text("value = 1\n", encoding="utf-8")
+            (root / "remove.py").write_text("value = 2\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "-qm", "initial"], check=True
+            )
+            first_commit = subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+            ).strip()
+            self.assertEqual(run("map", str(root)).returncode, 0)
+
+            (root / "remove.py").unlink()
+            (root / "keep.py").write_text("value = 3\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "-qm", "change"], check=True
+            )
+            second_commit = subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+            ).strip()
+
+            updated = run("update", str(root))
+            self.assertEqual(updated.returncode, 0, updated.stderr)
+            self.assertIn("REPARSED 1 files", updated.stdout)
+            self.assertIn("REMOVED 1 files", updated.stdout)
+            document = (root / ".codex" / "project-map.md").read_text()
+            self.assertIn(f"- Previous Git commit: `{first_commit}`", document)
+            self.assertIn(f"- Current Git commit: `{second_commit}`", document)
+            self.assertIn("- Removed: `remove.py`", document)
+
+    def test_incremental_update_hashes_git_hidden_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Test"],
+                check=True,
+            )
+            source = root / "hidden.py"
+            source.write_text("def old():\n    return 1\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "-qm", "initial"], check=True
+            )
+            self.assertEqual(run("map", str(root)).returncode, 0)
+            subprocess.run(
+                ["git", "-C", str(root), "update-index", "--assume-unchanged", "hidden.py"],
+                check=True,
+            )
+            source.write_text("def new():\n    return 2\n", encoding="utf-8")
+
+            updated = run("update", str(root))
+            self.assertEqual(updated.returncode, 0, updated.stderr)
+            self.assertIn("REPARSED 1 files", updated.stdout)
+            document = (root / ".codex" / "project-map.md").read_text()
+            self.assertIn("- Changed: `hidden.py`", document)
+            self.assertIn("`function new`", document)
+
+    def test_incremental_update_upgrades_legacy_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "main.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+            self.assertEqual(run("map", str(root)).returncode, 0)
+            manifest_path = root / ".codex" / "project-map.manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["analyzer"] = "0.1.0"
+            manifest["files"]["main.py"] = {
+                "sha256": manifest["files"]["main.py"]["sha256"],
+                "size": manifest["files"]["main.py"]["size"],
+            }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            updated = run("update", str(root))
+            self.assertEqual(updated.returncode, 0, updated.stderr)
+            self.assertIn("REPARSED 1 files", updated.stdout)
+            upgraded = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(upgraded["analyzer"], "0.2.0")
+            self.assertEqual(upgraded["files"]["main.py"]["language"], "python")
 
 
 if __name__ == "__main__":
